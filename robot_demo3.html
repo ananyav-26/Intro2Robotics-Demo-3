@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Demo 3 — Inverse Kinematics</title>
+<style>
+:root{font-family:system-ui,Segoe UI,sans-serif;color:#242235;background:#f6f3fb}
+body{margin:0;padding:24px}.app{max-width:1000px;margin:auto}.hero{background:#fff;border:1px solid #e5deef;border-radius:20px;padding:24px;margin-bottom:16px}
+h1{margin:0 0 6px;font-size:clamp(1.6rem,3vw,2.2rem)}p{line-height:1.5}.muted{color:#696578}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.card{background:white;border:1px solid #e5deef;border-radius:16px;padding:18px}.fields{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+label{display:block;font-size:.9rem;margin-bottom:5px}input{box-sizing:border-box;width:100%;padding:10px;border:1px solid #cfc5dd;border-radius:9px;font:inherit}
+button{border:0;border-radius:10px;padding:11px 14px;font:inherit;font-weight:650;cursor:pointer;background:#6746a5;color:white;margin:4px 4px 4px 0}
+button.secondary{background:#eee8f6;color:#3e3157}button.danger{background:#a3374c}.row{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.status{padding:12px;border-radius:10px;background:#f0ebf7;margin-top:12px;white-space:pre-wrap}.solution{padding:10px;border:1px solid #e3dbea;border-radius:10px;margin:8px 0;display:flex;gap:10px;align-items:flex-start}
+.solution input{width:auto;margin-top:4px}.solution pre{margin:0;white-space:pre-wrap;font-size:.88rem}.warning{background:#fff4d9;border:1px solid #ecd79b;padding:12px;border-radius:10px}
+small{color:#716a7c}.disabled{opacity:.55}@media(max-width:480px){body{padding:12px}.fields{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+ <section class="hero">
+  <h1>Robot Demo 3: Inverse Kinematics</h1>
+  <p class="muted">Coordinate entry · IK solution candidates · Arduino serial control · pick and place</p>
+  <div class="warning"><strong>Before hardware motion:</strong> the DH values below are provisional placeholders, not measured geometry. Replace them with your verified six-row standard-DH table and calibrate every servo. Numerical IK candidate count is not guaranteed to include every possible solution. Keep hands clear and test with the arm unloaded.</div>
+  <div class="row" style="margin-top:12px">
+   <button id="connect">Connect to Arduino</button><button class="secondary" id="disconnect">Disconnect</button><span id="connection" class="muted">Not connected</span>
+  </div>
+  <div id="status" class="status">Ready. You can test the kinematics offline before connecting hardware.</div>
+ </section>
+ <div class="grid">
+  <section class="card">
+   <h2>Target position (cm)</h2>
+   <div class="fields">
+    <div><label for="x">X</label><input id="x" type="number" step="any" value="10"></div>
+    <div><label for="y">Y</label><input id="y" type="number" step="any" value="5"></div>
+    <div><label for="z">Z</label><input id="z" type="number" step="any" value="3"></div>
+   </div>
+   <h3>Tool orientation (degrees)</h3>
+   <div class="fields">
+    <div><label for="roll">Roll</label><input id="roll" type="number" value="180"></div>
+    <div><label for="pitch">Pitch</label><input id="pitch" type="number" value="0"></div>
+    <div><label for="yaw">Yaw</label><input id="yaw" type="number" value="0"></div>
+   </div>
+   <div class="row" style="margin-top:12px"><button id="solve">Find IK solutions</button></div>
+   <p class="muted"><small>Uses the six-row standard-DH table in the script. Update the table in the JavaScript before trusting results.</small></p>
+  </section>
+  <section class="card">
+   <h2>Selected solution</h2>
+   <p id="count">Solutions detected: 0</p>
+   <div id="solutions"><p class="muted">Calculate a target to list candidate joint angles.</p></div>
+   <div class="row"><button id="move">Move to selected solution</button><button class="secondary" id="home">Home</button></div>
+   <div class="row"><button class="secondary" id="open">Open gripper</button><button class="secondary" id="close">Close gripper</button></div>
+  </section>
+ </div>
+ <section class="card" style="margin-top:16px">
+  <h2>Pick and place</h2>
+  <p>Plans a vertical approach, grasp, lift, destination approach, place and release. It requires valid IK at every waypoint. The sequence is open-loop and uses timed commands.</p>
+  <div class="row"><button id="pickplace">Pick target → place at [5,5,0]</button><label style="display:flex;gap:8px;align-items:center;margin:4px"><input id="allowMotion" type="checkbox" style="width:auto"> I have calibrated the geometry and servos; allow multi-step motion</label></div>
+  <p class="muted"><small>Do not check the box until you have verified geometry and safe servo limits. Test without a block first.</small></p>
+ </section>
+</div>
+<script>
+"use strict";
+// ===== CONFIG: replace with verified standard-DH values, in millimetres =====
+const DH = [
+ {thetaOffset:0,d:70,a:0,alpha:90,min:-90,max:90},
+ {thetaOffset:0,d:0,a:110,alpha:0,min:-90,max:90},
+ {thetaOffset:0,d:0,a:129,alpha:0,min:-90,max:90},
+ {thetaOffset:0,d:0,a:150,alpha:90,min:-90,max:90},
+ {thetaOffset:0,d:52,a:0,alpha:0,min:-90,max:90},
+ {thetaOffset:0,d:0,a:0,alpha:90,min:-180,max:180}
+];
+const HOME=[0,0,0,0,0,0], IK={tolPos:8,tolOri:15,maxIter:160,damping:.08,seeds:100};
+const APPROACH_MM=40, LIFT_MM=50, DEST=[5,5,0], MOVE_DELAY_MS=1300, GRIP_DELAY_MS=700;
+let port=null, reader=null, writer=null, solutions=[], target=null, selected=0, readLoop=null;
+const $=id=>document.getElementById(id);
+function status(s){$("status").textContent=s}
+function rad(d){return d*Math.PI/180} function deg(r){return r*180/Math.PI}
+function eye(){return [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}
+function mm(A,B){let C=Array.from({length:A.length},()=>Array(B[0].length).fill(0));for(let i=0;i<A.length;i++)for(let j=0;j<B[0].length;j++)for(let k=0;k<B.length;k++)C[i][j]+=A[i][k]*B[k][j];return C}
+function dhT(q,p){let t=q+rad(p.thetaOffset),a=rad(p.alpha),ct=Math.cos(t),st=Math.sin(t),ca=Math.cos(a),sa=Math.sin(a);return [[ct,-st*ca,st*sa,p.a*ct],[st,ct*ca,-ct*sa,p.a*st],[0,sa,ca,p.d],[0,0,0,1]]}
+function fk(q){let T=eye();for(let i=0;i<6;i++)T=mm(T,dhT(q[i],DH[i]));return T}
+function rpy(roll,pitch,yaw){let r=rad(roll),p=rad(pitch),y=rad(yaw),Rx=[[1,0,0],[0,Math.cos(r),-Math.sin(r)],[0,Math.sin(r),Math.cos(r)]],Ry=[[Math.cos(p),0,Math.sin(p)],[0,1,0],[-Math.sin(p),0,Math.cos(p)]],Rz=[[Math.cos(y),-Math.sin(y),0],[Math.sin(y),Math.cos(y),0],[0,0,1]];return mm(mm(Rz,Ry),Rx)}
+function oriErr(R,T){let c0=[R[0][0],R[1][0],R[2][0]],c1=[R[0][1],R[1][1],R[2][1]],c2=[R[0][2],R[1][2],R[2][2]],d0=[T[0][0],T[1][0],T[2][0]],d1=[T[0][1],T[1][1],T[2][1]],d2=[T[0][2],T[1][2],T[2][2]],cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],a=cross(c0,d0),b=cross(c1,d1),c=cross(c2,d2);return a.map((v,i)=>.5*(v+b[i]+c[i]))}
+function err(T,pos,R){let pe=pos.map((v,i)=>v-T[i][3]),oe=oriErr(T.map(r=>r.slice(0,3)),R);return [...pe,...oe.map(v=>v*80)]}
+function jac(q){let T0=fk(q),p0=T0.map(r=>r[3]).slice(0,3),R0=T0.map(r=>r.slice(0,3)),J=Array.from({length:6},()=>Array(6).fill(0)),eps=1e-5;for(let j=0;j<6;j++){let qp=q.slice();qp[j]+=eps;let T=fk(qp),p=T.map(r=>r[3]).slice(0,3),oe=oriErr(R0,T.map(r=>r.slice(0,3)));for(let i=0;i<3;i++){J[i][j]=(p[i]-p0[i])/eps;J[i+3][j]=oe[i]/eps*80}}return J}
+function solveLinear(A,b){A=A.map((r,i)=>r.slice().concat(b[i]));let n=b.length;for(let i=0;i<n;i++){let m=i;for(let k=i+1;k<n;k++)if(Math.abs(A[k][i])>Math.abs(A[m][i]))m=k;if(Math.abs(A[m][i])<1e-12)throw Error("Singular matrix");[A[i],A[m]]=[A[m],A[i]];let d=A[i][i];for(let j=i;j<=n;j++)A[i][j]/=d;for(let k=0;k<n;k++)if(k!==i){let f=A[k][i];for(let j=i;j<=n;j++)A[k][j]-=f*A[i][j]}}return A.map(r=>r[n])}
+function solveOne(pos,R,seed){let q=seed.slice(),lo=DH.map(p=>rad(p.min)),hi=DH.map(p=>rad(p.max));for(let it=0;it<IK.maxIter;it++){let T=fk(q),e=err(T,pos,R),pe=Math.hypot(pos[0]-T[0][3],pos[1]-T[1][3],pos[2]-T[2][3]),oe=Math.hypot(...oriErr(T.map(r=>r.slice(0,3)),R));if(pe<=IK.tolPos&&oe<=rad(IK.tolOri))return q;let J=jac(q),JT=J[0].map((_,j)=>J.map(row=>row[j])),A=JT.map((row,i)=>JT.map((_,j)=>row.reduce((s,v,k)=>s+v*J[k][j],0)+(i===j?IK.damping**2:0))),b=JT.map(row=>row.reduce((s,v,k)=>s+v*e[k],0)),dq;try{dq=solveLinear(A,b)}catch{return null}q=q.map((v,i)=>Math.max(lo[i],Math.min(hi[i],v+Math.max(-.18,Math.min(.18,dq[i])))))}return null}
+function findIK(x,y,z,orientation){let pos=[x*10,y*10,z*10],R=rpy(...orientation),lo=DH.map(p=>rad(p.min)),hi=DH.map(p=>rad(p.max)),rng=()=>lo.map((v,i)=>v+Math.random()*(hi[i]-v)),seeds=[HOME.map(rad)];for(let i=1;i<IK.seeds;i++)seeds.push(rng());let found=[];for(let seed of seeds){let q=solveOne(pos,R,seed);if(q&&!found.some(old=>Math.max(...q.map((v,i)=>Math.abs(deg(v-old[i]))) )<4))found.push(q)}found.sort((a,b)=>Math.hypot(...a.map((v,i)=>v-rad(HOME[i])))-Math.hypot(...b.map((v,i)=>v-rad(HOME[i]))));return {pos,R,solutions:found}}
+function renderSolutions(){let root=$("solutions");root.innerHTML="";$("count").textContent=`Solutions detected: ${solutions.length} (numerical candidates found; not guaranteed exhaustive)`;if(!solutions.length){root.innerHTML="<p class='muted'>No candidate found. Check target, DH values, orientation and joint limits.</p>";return}solutions.forEach((q,i)=>{let label=document.createElement("label");label.className="solution";let radio=document.createElement("input");radio.type="radio";radio.name="sol";radio.checked=i===selected;radio.addEventListener("change",()=>selected=i);let pre=document.createElement("pre");let T=fk(q),pErr=Math.hypot(target.pos[0]-T[0][3],target.pos[1]-T[1][3],target.pos[2]-T[2][3]);pre.textContent=`Solution ${i} (degrees)\n[${q.map(v=>deg(v).toFixed(1)).join(", ")}]\nFK position error: ${pErr.toFixed(1)} mm`;label.append(radio,pre);root.append(label)})}
+function calculate(){try{let vals=["x","y","z","roll","pitch","yaw"].map(id=>Number($(id).value));if(vals.some(v=>!Number.isFinite(v)))throw Error("Enter valid numeric coordinates and orientation.");target=findIK(...vals.slice(0,3),vals.slice(3));solutions=target.solutions;selected=0;renderSolutions();status(solutions.length?"Offline IK complete. Validate the DH values before physical movement.":"No numerical solution found for this target and orientation.")}catch(e){status(e.message)}}
+async function connect(){if(!("serial" in navigator)){status("Web Serial is not supported here. Use Chrome or Edge on desktop, and open this file from localhost or HTTPS.");return}try{port=await navigator.serial.requestPort();await port.open({baudRate:115200});writer=port.writable.getWriter();reader=port.readable.getReader();$("connection").textContent="Connected";status("Connected. Keep the arm unloaded and calibrate before motion.");readLoop=(async()=>{const dec=new TextDecoder();let buf="";try{while(true){let {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});let lines=buf.split(/\r?\n/);buf=lines.pop();for(let line of lines)if(line.trim())status("Arduino: "+line.trim())}}catch(e){status("Serial read ended: "+e.message)}})()}catch(e){status("Connection failed: "+e.message)}}
+async function disconnect(){try{if(reader){await reader.cancel();reader.releaseLock();reader=null}if(writer){await writer.close();writer=null}if(port){await port.close();port=null}}catch(e){}$("connection").textContent="Not connected";status("Disconnected.")}
+async function send(line){if(!writer){status("Connect to Arduino first; command not sent.");return false}try{await writer.write(new TextEncoder().encode(line+"\n"));status("Sent: "+line);return true}catch(e){status("Serial write failed: "+e.message);return false}}
+async function moveQ(q){return send("MOVE "+q.map(v=>deg(v).toFixed(2)).join(","))}
+$("connect").onclick=connect;$("disconnect").onclick=disconnect;$("solve").onclick=calculate;
+$("move").onclick=()=>{if(!solutions.length)return status("Calculate solutions first.");moveQ(solutions[selected])};
+$("home").onclick=()=>send("HOME");$("open").onclick=()=>send("GRIP OPEN");$("close").onclick=()=>send("GRIP CLOSE");
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+$("pickplace").onclick=async()=>{if(!$("allowMotion").checked)return status("Safety gate: verify DH geometry, tool orientation, wiring and servo limits, then check the confirmation box.");if(!solutions.length||!target)return status("Calculate a reachable target first.");let orient=["roll","pitch","yaw"].map(id=>Number($(id).value)),src=[Number($("x").value),Number($("y").value),Number($("z").value)],wps=[[src[0],src[1],src[2]+APPROACH_MM/10],[...src],[src[0],src[1],src[2]+LIFT_MM/10],[DEST[0],DEST[1],DEST[2]+APPROACH_MM/10],[...DEST]],planned=[],prev=solutions[selected];for(let wp of wps){let result=findIK(...wp,orient);if(!result.solutions.length)return status("Aborted before movement: no IK candidate for waypoint "+wp.join(","));let q=result.solutions.reduce((best,c)=>Math.hypot(...c.map((v,i)=>v-prev[i]))<Math.hypot(...best.map((v,i)=>v-prev[i]))?c:best,result.solutions[0]);planned.push(q);prev=q}if(!confirm("This will move the robot through multiple poses. Confirm the area is clear and the arm is calibrated."))return;for(let i=0;i<planned.length;i++){if(!await moveQ(planned[i]))return;await wait(MOVE_DELAY_MS);if(i===1){if(!await send("GRIP CLOSE"))return;await wait(GRIP_DELAY_MS)}if(i===4){if(!await send("GRIP OPEN"))return;await wait(GRIP_DELAY_MS)}}await moveQ(planned[3]);status("Sequence commands sent. Verify block placement manually.")};
+</script>
+</body>
+</html>
